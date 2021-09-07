@@ -5,28 +5,42 @@ from torchvision.models import resnet18
 import torch.optim as optim
 from torch import nn
 import torch.nn.functional as F
+import re
+
+from quantizers.quantizer import Quantizer
 
 from progress.bar import Bar
 import wandb
 
+
+default_setting_dict=dict(
+    lr_scheme='adaptive',
+    learning_rate=0.005,
+    batch_size=150,
+    momentum=0.9,
+    max_epoch=150,
+    observe_period=7,
+    drop_lr_period=14,
+    stop_period=25,
+    stop_ratio=0.1,
+    drop_ratio=0.1,
+    lr_drop_multiplier=0.1,
+    use_pretrain=True,
+    float_kept_quantize=True,
+    weight_bw=8,
+    quantize_momentum=0.99,
+    bias_bw=0,
+    weight_quantize_scheme='AdaptiveMoving',
+    bias_quantize_scheme='AdaptiveMoving'
+)
+
+default_setting_dict.update({'break_epoch_after_lr_drop': default_setting_dict['observe_period']})
+
 # 1. Start a W&B run
-wandb.init(project='AdaLR_vs_InvarLR')
+wandb.init(project='Sweep_Directly_vs_Float_kept_Quantize', config=default_setting_dict)
 
 # 2. Save model inputs and hyperparameters
 config = wandb.config
-config.lr_scheme = 'normal'
-config.learning_rate = 0.01
-config.batch_size = 150
-config.momentum = 0.9
-config.max_epoch = 100
-config.observe_period = 5
-config.drop_lr_period = 10
-config.stop_period = 20
-config.stop_ratio = 0.1
-config.drop_ratio = 0.1
-config.lr_drop_multiplier = 0.1
-config.break_epoch_after_lr_drop = config.observe_period
-config.use_pretrain = True
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -52,28 +66,24 @@ testloader = torch.utils.data.DataLoader(testset, batch_size=config.batch_size,
 classes = ('plane', 'car', 'bird', 'cat',
            'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
 
-class Net(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(3, 6, 5)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(6, 16, 5)
-        self.fc1 = nn.Linear(16 * 5 * 5, 120)
-        self.fc2 = nn.Linear(120, 84)
-        self.fc3 = nn.Linear(84, 10)
-
-    def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = torch.flatten(x, 1) # flatten all dimensions except batch
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
 
 model = resnet18(pretrained=config.use_pretrain, progress=True)
-# model = Net()
 model.to(device)
+
+if config.weight_bw > 0:
+    weight_quantize_list = [(name, param) for name, param in model.named_parameters() if re.search('weight', name, re.I)]
+    weight_quantizer = Quantizer(weight_quantize_list, quan_bw=config.weight_bw, momentum=config.quantize_momentum,
+                                 scheme=config.weight_quantize_scheme, allow_zp_out_of_bound=False,
+                                 float_kept=config.float_kept_quantize)
+    print('weight will be quantized.')
+
+
+if config.bias_bw > 0:
+    bias_quantize_list = [(name, param) for name, param in model.named_parameters() if re.search('bias', name, re.I)]
+    bias_quantizer = Quantizer(bias_quantize_list, quan_bw=config.bias_bw, momentum=config.quantize_momentum,
+                               scheme=config.bias_quantize_scheme, allow_zp_out_of_bound=False,
+                               float_kept=config.float_kept_quantize)
+    print('bias will be quantized.')
 
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.momentum)
@@ -96,7 +106,24 @@ for epoch in range(config.max_epoch):  # loop over the dataset multiple times
         outputs = model(inputs)
         loss = criterion(outputs, labels)
         loss.backward()
+
+        if config.float_kept_quantize:
+            for name, param in model.named_parameters():
+                if hasattr(param, 'org'):
+                    param.data = param.org.clone()
+
         optimizer.step()
+
+        if config.float_kept_quantize:
+            for name, param in model.named_parameters():
+                if hasattr(param, 'org'):
+                    param.org = param.data.clone()
+
+        if 'weight_quantizer' in locals().keys():
+            weight_quantizer.update()
+
+        if 'bias_quantizer' in locals().keys():
+            bias_quantizer.update()
 
         # print statistics
         running_loss += loss.item()
@@ -118,10 +145,6 @@ for epoch in range(config.max_epoch):  # loop over the dataset multiple times
             stop_observe_ratio = abs((loss_mean_observe - loss_mean_stop_observe) / loss_mean_stop_observe) if ((loss_mean_observe is not None) and (loss_mean_stop_observe is not None)) else None
             if (stop_observe_ratio is not None) and (stop_observe_ratio < config.stop_ratio):
                 break
-                # cmd = input('The model seems reach minima, should we stop? [N/y]')
-                # if cmd in ['Y', 'y']:
-                #     break
-                # have_a_break = 3
             elif (drop_observe_ratio is not None) and (drop_observe_ratio < config.drop_ratio):
                 lr = optimizer.param_groups[0]['lr']
                 lr = config.lr_drop_multiplier * lr
@@ -130,10 +153,6 @@ for epoch in range(config.max_epoch):  # loop over the dataset multiple times
                 have_a_break = config.break_epoch_after_lr_drop
 
 print('Finished Training')
-
-
-PATH = './cifar_net.pth'
-torch.save(model.state_dict(), PATH)
 
 correct = 0
 total = 0

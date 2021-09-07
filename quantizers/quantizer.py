@@ -49,7 +49,7 @@ class Observer(object):
 class BaseQuantizer(object):
     valid_scheme_keys = ['Moving', ('MinMax', 'Symmetric'), 'Adaptive'] # 嵌套深度: 1 层
 
-    def __init__(self, scheme='MovingMinMax', params=None, int_range=None, momentum=None, allow_zp_out_of_bound=True):
+    def __init__(self, scheme='MovingMinMax', params=None, int_range=None, momentum=None, allow_zp_out_of_bound=True, float_kept=False):
         # get quantized data, scale, and zero_point
         if params is not None:
             assert isinstance(params, torch.nn.Parameter)
@@ -57,6 +57,7 @@ class BaseQuantizer(object):
         else:
             raise ValueError('请传入data')
 
+        self.float_kept = float_kept
         self.allow_zp_out_of_bound = allow_zp_out_of_bound
         # below parameters are left to scheme_praser to set
         self.symmetric = None
@@ -174,6 +175,8 @@ class BaseQuantizer(object):
         self.observer.update(self.params.data)
         # reset the quantization setting based on new observation
         self._update_quantize_config()
+        if self.float_kept:
+            self.params.org = self.params.data.clone()
         self.data, self.scale, self.zp = self._quantize(self.params.data)
         self.params.data = self.float()
         return
@@ -216,9 +219,9 @@ class BaseQuantizer(object):
 
 
 class Quantizer:
-    def __init__(self, named_params, quan_bw=8, momentum=0.99, only_weight=True, first_layer_quantize=True,
-                 offset_gen_quantize=True, scheme='Moving', allow_zp_out_of_bound=True):
+    def __init__(self, named_params, quan_bw=8, momentum=0.99, scheme='Moving', allow_zp_out_of_bound=True, float_kept=False):
         self.quan_bit_width = quan_bw
+        self.float_kept = float_kept
         self.quan_range = [0, pow(2, self.quan_bit_width) - 1]
         self.momentum = momentum
         self.allow_zp_out_of_bound = allow_zp_out_of_bound
@@ -226,16 +229,12 @@ class Quantizer:
         self.quantized_names = []
         for n, p in named_params:
             assert isinstance(p, torch.nn.Parameter)
-            if (not first_layer_quantize) & bool(re.search("^conv1", n, re.I)):
-                continue
-            if (not offset_gen_quantize) & bool(re.search('^deconv_layers\.[0-9]+\.conv_offset_mask', n, re.I)):
-                continue
-            if only_weight & ('weight' in n):
-                self.quantizers_list.append(BaseQuantizer(scheme,
-                                                          params=p, int_range=self.quan_range, momentum=0.99,
-                                                          allow_zp_out_of_bound=self.allow_zp_out_of_bound))
-                self.quantized_names.append(n)
-                print('[{}] use [{}] quantization scheme'.format(n, scheme))
+            self.quantizers_list.append(BaseQuantizer(scheme,
+                                                      params=p, int_range=self.quan_range, momentum=0.99,
+                                                      allow_zp_out_of_bound=self.allow_zp_out_of_bound,
+                                                      float_kept=self.float_kept))
+            self.quantized_names.append(n)
+            print('[{}] use [{}] quantization scheme in {} bit.'.format(n, scheme, self.quan_bit_width))
 
     def update(self):
         for quanter in self.quantizers_list:
