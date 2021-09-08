@@ -88,8 +88,6 @@ class BaseQuantizer(object):
         self.data = None
         self.zp = None
 
-        self.update()
-
     def scheme_praser(self, scheme, momentum):
         # 检验scheme的有效性
         self.scheme_validate(scheme)

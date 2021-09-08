@@ -31,7 +31,8 @@ default_setting_dict=dict(
     quantize_momentum=0.99,
     bias_bw=0,
     weight_quantize_scheme='AdaptiveMoving',
-    bias_quantize_scheme='AdaptiveMoving'
+    bias_quantize_scheme='AdaptiveMoving',
+    optimizer='adam'
 )
 
 default_setting_dict.update({'break_epoch_after_lr_drop': default_setting_dict['observe_period']})
@@ -75,6 +76,8 @@ if config.weight_bw > 0:
     weight_quantizer = Quantizer(weight_quantize_list, quan_bw=config.weight_bw, momentum=config.quantize_momentum,
                                  scheme=config.weight_quantize_scheme, allow_zp_out_of_bound=False,
                                  float_kept=config.float_kept_quantize)
+    weight_quantizer.save_params_from_data_to_org()
+    weight_quantizer.update()
     print('weight will be quantized.')
 
 
@@ -83,10 +86,22 @@ if config.bias_bw > 0:
     bias_quantizer = Quantizer(bias_quantize_list, quan_bw=config.bias_bw, momentum=config.quantize_momentum,
                                scheme=config.bias_quantize_scheme, allow_zp_out_of_bound=False,
                                float_kept=config.float_kept_quantize)
+    bias_quantizer.save_params_from_data_to_org()
+    bias_quantizer.update()
     print('bias will be quantized.')
 
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.momentum)
+if config.optimizer == 'sgd':
+    optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.momentum)
+    print('Optimizer is set to \033[35mSGD\033[0m, using lr={}, momentum={}.'.format(optimizer.param_groups[0]['lr'],
+                                                                                     optimizer.param_groups[0][
+                                                                                         'momentum']))
+elif config.optimizer == 'adam':
+    optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
+    print('Optimizer is set to \033[35mAdam\033[0m, using lr={}, momentum=\033[33mIGNORED\033[0m.'.format(
+        optimizer.param_groups[0]['lr']))
+else:
+    raise ValueError('Choice of optimizer should be sgd or adam.')
 
 loss_rec = []
 have_a_break = 0
