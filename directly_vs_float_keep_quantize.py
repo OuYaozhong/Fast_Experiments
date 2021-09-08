@@ -26,7 +26,7 @@ default_setting_dict=dict(
     drop_ratio=0.1,
     lr_drop_multiplier=0.1,
     use_pretrain=True,
-    float_kept_quantize=True,
+    float_kept_quantize=False,
     weight_bw=8,
     quantize_momentum=0.99,
     bias_bw=0,
@@ -37,7 +37,7 @@ default_setting_dict=dict(
 default_setting_dict.update({'break_epoch_after_lr_drop': default_setting_dict['observe_period']})
 
 # 1. Start a W&B run
-wandb.init(project='Sweep_Directly_vs_Float_kept_Quantize', config=default_setting_dict)
+wandb.init(project='Directly_vs_Float_kept_Quantize_test', config=default_setting_dict)
 
 # 2. Save model inputs and hyperparameters
 config = wandb.config
@@ -108,21 +108,23 @@ for epoch in range(config.max_epoch):  # loop over the dataset multiple times
         loss.backward()
 
         if config.float_kept_quantize:
-            for name, param in model.named_parameters():
-                if hasattr(param, 'org'):
-                    param.data = param.org.clone()
+            if config.weight_bw > 0:
+                weight_quantizer.restore_param_from_org_to_data()
+            if config.bias_bw > 0:
+                bias_quantizer.restore_param_from_org_to_data()
 
         optimizer.step()
 
         if config.float_kept_quantize:
-            for name, param in model.named_parameters():
-                if hasattr(param, 'org'):
-                    param.org = param.data.clone()
+            if config.weight_bw > 0:
+                weight_quantizer.save_params_from_data_to_org()
+            if config.bias_bw > 0:
+                bias_quantizer.save_params_from_data_to_org()
 
-        if 'weight_quantizer' in locals().keys():
+        if config.weight_bw > 0:
             weight_quantizer.update()
 
-        if 'bias_quantizer' in locals().keys():
+        if config.bias_bw > 0:
             bias_quantizer.update()
 
         # print statistics
@@ -153,6 +155,7 @@ for epoch in range(config.max_epoch):  # loop over the dataset multiple times
                 have_a_break = config.break_epoch_after_lr_drop
 
 print('Finished Training')
+wandb.log({"run_epoch": epoch})
 
 correct = 0
 total = 0

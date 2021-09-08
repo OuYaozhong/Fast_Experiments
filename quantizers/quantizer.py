@@ -49,7 +49,7 @@ class Observer(object):
 class BaseQuantizer(object):
     valid_scheme_keys = ['Moving', ('MinMax', 'Symmetric'), 'Adaptive'] # 嵌套深度: 1 层
 
-    def __init__(self, scheme='MovingMinMax', params=None, int_range=None, momentum=None, allow_zp_out_of_bound=True, float_kept=False):
+    def __init__(self, scheme='MovingMinMax', params=None, int_range=None, momentum=None, allow_zp_out_of_bound=True):
         # get quantized data, scale, and zero_point
         if params is not None:
             assert isinstance(params, torch.nn.Parameter)
@@ -57,7 +57,6 @@ class BaseQuantizer(object):
         else:
             raise ValueError('请传入data')
 
-        self.float_kept = float_kept
         self.allow_zp_out_of_bound = allow_zp_out_of_bound
         # below parameters are left to scheme_praser to set
         self.symmetric = None
@@ -175,8 +174,6 @@ class BaseQuantizer(object):
         self.observer.update(self.params.data)
         # reset the quantization setting based on new observation
         self._update_quantize_config()
-        if self.float_kept:
-            self.params.org = self.params.data.clone()
         self.data, self.scale, self.zp = self._quantize(self.params.data)
         self.params.data = self.float()
         return
@@ -195,6 +192,12 @@ class BaseQuantizer(object):
         if self.symmetric:
             assert zp == (self.int_min + self.int_max) // 2
         return data, scale, zp
+
+    def save_from_data_to_org(self):
+        self.params.org = self.params.data.clone()
+
+    def restore_from_org_to_data(self):
+        self.params.data = self.params.org.clone()
 
     def float(self):
         return self.scale * (self.data.to(torch.float) - self.zp)
@@ -231,14 +234,22 @@ class Quantizer:
             assert isinstance(p, torch.nn.Parameter)
             self.quantizers_list.append(BaseQuantizer(scheme,
                                                       params=p, int_range=self.quan_range, momentum=0.99,
-                                                      allow_zp_out_of_bound=self.allow_zp_out_of_bound,
-                                                      float_kept=self.float_kept))
+                                                      allow_zp_out_of_bound=self.allow_zp_out_of_bound))
             self.quantized_names.append(n)
-            print('[{}] use [{}] quantization scheme in {} bit.'.format(n, scheme, self.quan_bit_width))
+            suffix = 'Keep the Float in Quantization' if self.float_kept else 'Directly Quantize'
+            print('[{}] use \033[35m[{}]\033[0m quantization scheme in \033[35m{} bit\033[0m, \033[35m{}\033[0m.'.format(n, scheme, self.quan_bit_width, suffix))
 
     def update(self):
         for quanter in self.quantizers_list:
             quanter.update()
+
+    def save_params_from_data_to_org(self):
+        for quanter in self.quantizers_list:
+            quanter.save_from_data_to_org()
+
+    def restore_param_from_org_to_data(self):
+        for quanter in self.quantizers_list:
+            quanter.restore_from_org_to_data()
 
 
 def get_correct(x, scheme='MinMax', qmin=0, qmax=255):
