@@ -49,14 +49,7 @@ class Observer(object):
 class BaseQuantizer(object):
     valid_scheme_keys = ['Moving', ('MinMax', 'Symmetric'), 'Adaptive'] # 嵌套深度: 1 层
 
-    def __init__(self, scheme='MovingMinMax', params=None, int_range=None, momentum=None, allow_zp_out_of_bound=True):
-        # get quantized data, scale, and zero_point
-        if params is not None:
-            assert isinstance(params, torch.nn.Parameter)
-            self.params = params
-        else:
-            raise ValueError('请传入data')
-
+    def __init__(self, scheme='MovingMinMax', int_range=None, momentum=None, allow_zp_out_of_bound=True):
         self.allow_zp_out_of_bound = allow_zp_out_of_bound
         # below parameters are left to scheme_praser to set
         self.symmetric = None
@@ -168,13 +161,13 @@ class BaseQuantizer(object):
         self.float_full_scale = self.float_max - self.float_min
         return
 
-    def update(self):
-        self.observer.update(self.params.data)
+    def update(self, data_to_be_quantize):
+        self.observer.update(data_to_be_quantize)
         # reset the quantization setting based on new observation
         self._update_quantize_config()
-        self.data, self.scale, self.zp = self._quantize(self.params.data)
-        self.params.data = self.float()
-        return
+        self.data, self.scale, self.zp = self._quantize(data_to_be_quantize)
+        data_to_be_quantize = self.float()
+        return data_to_be_quantize
 
     def _quantize(self, x):
         # 由于其他函数 self._update_quantize_config 设置好了参数，因而，_quantize函数无论什么情况，都按照一样的流程进行量化
@@ -191,17 +184,8 @@ class BaseQuantizer(object):
             assert zp == (self.int_min + self.int_max) // 2
         return data, scale, zp
 
-    def save_from_data_to_org(self):
-        self.params.org = self.params.data.clone()
-
-    def restore_from_org_to_data(self):
-        self.params.data = self.params.org.clone()
-
     def float(self):
         return self.scale * (self.data.to(torch.float) - self.zp)
-
-    def to(self, *args):
-        self.params.data.to(*args)
 
     def _check_data(self, x):
         assert isinstance(x, torch.Tensor)
@@ -219,7 +203,43 @@ class BaseQuantizer(object):
                '\tAdaptive: {})'.format(self_name, self.data, self.int_max, self.int_min, self.scale, self.zp, self.symmetric, self.adaptive)
 
 
-class Quantizer:
+class Parameter_BaseQuantizer(BaseQuantizer):
+    def __init__(self, *args, params=None, **kwargs):
+        # get quantized data, scale, and zero_point
+        if params is not None:
+            assert isinstance(params, torch.nn.Parameter)
+            self.params = params
+        else:
+            raise ValueError('请传入data')
+
+        super(Parameter_BaseQuantizer, self).__init__(*args, **kwargs)
+
+        # record
+        self.save_from_data_to_org_times = 0
+        self.restore_from_org_to_data_times = 0
+
+    def quantize_params(self):
+        self.update(self.params.data)
+
+    def save_from_data_to_org(self):
+        self.params.org = self.params.data.clone()
+        self.save_from_data_to_org_times += 1
+
+    def restore_from_org_to_data(self):
+        self.params.data = self.params.org.clone()
+        self.restore_from_org_to_data_times += 1
+
+    def reset_save_from_data_to_org_times(self):
+        self.save_from_data_to_org_times = 0
+
+    def reset_restore_from_org_to_data_times(self):
+        self.restore_from_org_to_data_times = 0
+
+    def to(self, *args):
+        self.params.data.to(*args)
+
+
+class Parameter_Quantizer:
     def __init__(self, named_params, quan_bw=8, momentum=0.99, scheme='Moving', allow_zp_out_of_bound=True, float_kept=False):
         self.quan_bit_width = quan_bw
         self.float_kept = float_kept
@@ -230,16 +250,16 @@ class Quantizer:
         self.quantized_names = []
         for n, p in named_params:
             assert isinstance(p, torch.nn.Parameter)
-            self.quantizers_list.append(BaseQuantizer(scheme,
+            self.quantizers_list.append(Parameter_BaseQuantizer(scheme,
                                                       params=p, int_range=self.quan_range, momentum=0.99,
                                                       allow_zp_out_of_bound=self.allow_zp_out_of_bound))
             self.quantized_names.append(n)
             suffix = 'Keep the Float in Quantization' if self.float_kept else 'Directly Quantize'
-            print('[{}] use \033[35m[{}]\033[0m quantization scheme in \033[35m{} bit\033[0m, \033[35m{}\033[0m.'.format(n, scheme, self.quan_bit_width, suffix))
+            print('[{}] use \033[35m[{}]\033[0m quantization scheme in \033[35m{} bit\033[0m, \033[34m{}\033[0m.'.format(n, scheme, self.quan_bit_width, suffix))
 
-    def update(self):
+    def quantize(self):
         for quanter in self.quantizers_list:
-            quanter.update()
+            quanter.quantize_params()
 
     def save_params_from_data_to_org(self):
         for quanter in self.quantizers_list:
@@ -249,6 +269,32 @@ class Quantizer:
         for quanter in self.quantizers_list:
             quanter.restore_from_org_to_data()
 
+    def get_average_save_times(self):
+        save_times_list = [quanter.save_from_data_to_org_times for quanter in self.quantizers_list]
+        average_save_times = sum(save_times_list) / len(save_times_list)
+        return average_save_times
+
+    def get_average_restore_times(self):
+        restore_times_list = [quanter.restore_from_org_to_data_times for quanter in self.quantizers_list]
+        average_restore_times = sum(restore_times_list) / len(restore_times_list)
+        return average_restore_times
+
+    def get_save_restore_average_times(self):
+        average_save_times = self.get_average_save_times()
+        average_restore_times = self.get_average_restore_times()
+        return average_save_times, average_restore_times
+
+    def reset_save_times(self):
+        for quanter in self.quantizers_list:
+            quanter.reset_save_from_data_to_org_times()
+
+    def reset_restore_times(self):
+        for quanter in self.quantizers_list:
+            quanter.reset_restore_from_org_to_data_times()
+
+    def reset_save_restore_times(self):
+        self.reset_save_times()
+        self.reset_restore_times()
 
 def get_correct(x, scheme='MinMax', qmin=0, qmax=255):
     valid_scheme = ['MinMax', 'Symmetric']

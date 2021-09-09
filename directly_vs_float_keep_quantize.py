@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torchvision
 import torchvision.transforms as transforms
@@ -6,8 +8,9 @@ import torch.optim as optim
 from torch import nn
 import torch.nn.functional as F
 import re
+import os
 
-from quantizers.quantizer import Quantizer
+from quantizers.quantizer import Parameter_Quantizer
 
 from progress.bar import Bar
 import wandb
@@ -28,17 +31,19 @@ default_setting_dict=dict(
     use_pretrain=True,
     float_kept_quantize=False,
     weight_bw=8,
-    quantize_momentum=0.99,
     bias_bw=0,
+    activation_bw=8,
+    quantize_momentum=0.99,
     weight_quantize_scheme='AdaptiveMoving',
     bias_quantize_scheme='AdaptiveMoving',
-    optimizer='adam'
+    optimizer='adam',
+    activation_quantize_layer_type=[nn.Conv2d]
 )
 
 default_setting_dict.update({'break_epoch_after_lr_drop': default_setting_dict['observe_period']})
 
 # 1. Start a W&B run
-wandb.init(project='Directly_vs_Float_kept_Quantize_test', config=default_setting_dict)
+wandb.init(project='test', config=default_setting_dict)
 
 # 2. Save model inputs and hyperparameters
 config = wandb.config
@@ -73,22 +78,33 @@ model.to(device)
 
 if config.weight_bw > 0:
     weight_quantize_list = [(name, param) for name, param in model.named_parameters() if re.search('weight', name, re.I)]
-    weight_quantizer = Quantizer(weight_quantize_list, quan_bw=config.weight_bw, momentum=config.quantize_momentum,
+    weight_quantizer = Parameter_Quantizer(weight_quantize_list, quan_bw=config.weight_bw, momentum=config.quantize_momentum,
                                  scheme=config.weight_quantize_scheme, allow_zp_out_of_bound=False,
                                  float_kept=config.float_kept_quantize)
-    weight_quantizer.save_params_from_data_to_org()
-    weight_quantizer.update()
+    if config.float_kept_quantize:
+        weight_quantizer.save_params_from_data_to_org()
+    weight_quantizer.quantize()
     print('weight will be quantized.')
-
 
 if config.bias_bw > 0:
     bias_quantize_list = [(name, param) for name, param in model.named_parameters() if re.search('bias', name, re.I)]
-    bias_quantizer = Quantizer(bias_quantize_list, quan_bw=config.bias_bw, momentum=config.quantize_momentum,
+    bias_quantizer = Parameter_Quantizer(bias_quantize_list, quan_bw=config.bias_bw, momentum=config.quantize_momentum,
                                scheme=config.bias_quantize_scheme, allow_zp_out_of_bound=False,
                                float_kept=config.float_kept_quantize)
-    bias_quantizer.save_params_from_data_to_org()
-    bias_quantizer.update()
+    if config.float_kept_quantize:
+        bias_quantizer.save_params_from_data_to_org()
+    bias_quantizer.quantize()
     print('bias will be quantized.')
+
+# if config.activation_bw > 0:
+#     activation_quantize_list = []
+#     quantize_layer_list = [eval(s) for s in config.activation_quantize_layer_type if not os.path.exists(s)]
+#     for name, module in model.named_modules():
+#         if isinstance(module, tuple(quantize_layer_list)):
+#             activation_quantize_list.append((name, module))
+#     activation_quantizer_dict = {}
+#     for name, module in activation_quantize_list:
+#         activation_quantizer_dict[name] = BaseQuantizer()
 
 criterion = nn.CrossEntropyLoss()
 if config.optimizer == 'sgd':
@@ -108,6 +124,11 @@ have_a_break = 0
 for epoch in range(config.max_epoch):  # loop over the dataset multiple times
     running_loss = 0.0
     model.train()
+
+    if 'weight_quantizer' in locals():
+        weight_quantizer.reset_save_restore_times()
+    if 'bias_quantizer' in locals():
+        bias_quantizer.reset_save_restore_times()
     bar = Bar('Processing', max=len(trainloader))
     for i, data in enumerate(trainloader):
         # get the inputs; data is a list of [inputs, labels]
@@ -123,29 +144,35 @@ for epoch in range(config.max_epoch):  # loop over the dataset multiple times
         loss.backward()
 
         if config.float_kept_quantize:
-            if config.weight_bw > 0:
+            if 'weight_quantizer' in locals():
                 weight_quantizer.restore_param_from_org_to_data()
-            if config.bias_bw > 0:
+            if 'bias_quantizer' in locals():
                 bias_quantizer.restore_param_from_org_to_data()
 
         optimizer.step()
 
-        if config.float_kept_quantize:
-            if config.weight_bw > 0:
+
+        if 'weight_quantizer' in locals():
+            if config.float_kept_quantize:
                 weight_quantizer.save_params_from_data_to_org()
-            if config.bias_bw > 0:
+            weight_quantizer.quantize()
+        if 'bias_quantizer' in locals():
+            if config.float_kept_quantize:
                 bias_quantizer.save_params_from_data_to_org()
-
-        if config.weight_bw > 0:
-            weight_quantizer.update()
-
-        if config.bias_bw > 0:
-            bias_quantizer.update()
+            bias_quantizer.quantize()
 
         # print statistics
         running_loss += loss.item()
         Bar.suffix = '[{phase:}] {0}/{1} |Tot: {total:} |ETA: {eta:} | loss: {loss:.3g}'.format(
-            i, len(trainloader), phase=epoch, total=bar.elapsed_td, eta=bar.eta_td, loss=running_loss/(i+1))
+            i, len(trainloader), phase=epoch, total=bar.elapsed_td, eta=bar.eta_td, loss=running_loss / (i + 1))
+        if 'weight_quantizer' in locals():
+            Bar.suffix += '| w_save_time: {w_save_time:.4g} | w_restore_time: {w_restore_time:.4g}'.format(
+                w_save_time=weight_quantizer.get_average_save_times(),
+                w_restore_time=weight_quantizer.get_average_restore_times())
+        if 'bias_quantizer' in locals():
+            Bar.suffix += '| b_save_time: {b_save_time:.4g} | b_restore_time: {b_restore_time:.4g}'.format(
+                b_save_time=bias_quantizer.get_average_save_times(),
+                b_restore_time=bias_quantizer.get_average_restore_times())
         bar.next()
     bar.finish()
     epoch_loss = running_loss / len(trainloader)
