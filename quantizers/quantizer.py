@@ -219,7 +219,7 @@ class Parameter_BaseQuantizer(BaseQuantizer):
         self.restore_from_org_to_data_times = 0
 
     def quantize_params(self):
-        self.update(self.params.data)
+        self.params.data = self.update(self.params.data)
 
     def save_from_data_to_org(self):
         self.params.org = self.params.data.clone()
