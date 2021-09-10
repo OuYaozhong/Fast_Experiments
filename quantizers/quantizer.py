@@ -1,5 +1,6 @@
 import torch
 import re
+import math
 
 
 class Observer(object):
@@ -49,7 +50,8 @@ class Observer(object):
 class BaseQuantizer(object):
     valid_scheme_keys = ['Moving', ('MinMax', 'Symmetric'), 'Adaptive'] # 嵌套深度: 1 层
 
-    def __init__(self, scheme='MovingMinMax', int_range=None, momentum=None, allow_zp_out_of_bound=True):
+    def __init__(self, scheme: str = 'MovingMinMax', int_range: (list, tuple) = None, momentum: float = None,
+                 allow_zp_out_of_bound: bool = True):
         self.allow_zp_out_of_bound = allow_zp_out_of_bound
         # below parameters are left to scheme_praser to set
         self.symmetric = None
@@ -57,7 +59,8 @@ class BaseQuantizer(object):
         self.adaptive = None
         # end
         # 先让scheme_praser解析scheme参数，设置重要的变量
-        self.scheme_praser(scheme=scheme, momentum=momentum)
+        self.scheme = scheme
+        self.scheme_praser(scheme=self.scheme, momentum=momentum)
 
         self.observer = Observer(momentum=self.momentum)
 
@@ -76,12 +79,12 @@ class BaseQuantizer(object):
         self.float_full_scale = None
         # end
 
-        self.eps = 1e-9
+        self.eps = 7./3 - 4./3 - 1
         self.scale = None
         self.data = None
         self.zp = None
 
-    def scheme_praser(self, scheme, momentum):
+    def scheme_praser(self, scheme: str, momentum: float):
         # 检验scheme的有效性
         self.scheme_validate(scheme)
         # set momentum
@@ -102,7 +105,7 @@ class BaseQuantizer(object):
                 print('由于启用Adaptive, Symmetric将被忽略')
         return
 
-    def scheme_validate(self, scheme):
+    def scheme_validate(self, scheme: str):
         assert isinstance(scheme, str)
         # valid_list内的tuple或list类型，视为互为冲突
         # conflict check
@@ -161,7 +164,7 @@ class BaseQuantizer(object):
         self.float_full_scale = self.float_max - self.float_min
         return
 
-    def update(self, data_to_be_quantize):
+    def update(self, data_to_be_quantize: torch.Tensor):
         self.observer.update(data_to_be_quantize)
         # reset the quantization setting based on new observation
         self._update_quantize_config()
@@ -169,7 +172,7 @@ class BaseQuantizer(object):
         data_to_be_quantize = self.float()
         return data_to_be_quantize
 
-    def _quantize(self, x):
+    def _quantize(self, x: torch.Tensor):
         # 由于其他函数 self._update_quantize_config 设置好了参数，因而，_quantize函数无论什么情况，都按照一样的流程进行量化
         self._check_data(x)
         scale = self.float_full_scale / self.int_full_scale
@@ -177,8 +180,8 @@ class BaseQuantizer(object):
         zp = self.int_min - round(self.float_min / scale)
         if not self.allow_zp_out_of_bound:
             zp = min(max(zp, self.int_min), self.int_max)
-        if (zp < 0) or (zp > 255):
-            print('problem')
+        if (not self.allow_zp_out_of_bound) and ((zp < self.int_min) or (zp > self.int_max)):
+            raise ValueError('The zp should not beyond [{}, {}] under setting allow_zp_out_of_bound = {}'.format(self.int_min, self.int_max, self.allow_zp_out_of_bound))
         data = (x / scale + zp).round().int()
         if self.symmetric:
             assert zp == (self.int_min + self.int_max) // 2
@@ -200,7 +203,8 @@ class BaseQuantizer(object):
                '\tscale: {}\n' \
                '\tzero-point: {}\n' \
                '\tSymmetric: {}\n' \
-               '\tAdaptive: {})'.format(self_name, self.data, self.int_max, self.int_min, self.scale, self.zp, self.symmetric, self.adaptive)
+               '\tAdaptive: {})'.format(self_name, self.data, self.int_max, self.int_min, self.scale,
+                                        self.zp, self.symmetric, self.adaptive)
 
 
 class Parameter_BaseQuantizer(BaseQuantizer):
@@ -240,7 +244,8 @@ class Parameter_BaseQuantizer(BaseQuantizer):
 
 
 class Parameter_Quantizer:
-    def __init__(self, named_params, quan_bw=8, momentum=0.99, scheme='Moving', allow_zp_out_of_bound=True, float_kept=False):
+    def __init__(self, named_params, quan_bw=8, momentum=0.99, scheme='Moving', allow_zp_out_of_bound=True,
+                 float_kept=False):
         self.quan_bit_width = quan_bw
         self.float_kept = float_kept
         self.quan_range = [0, pow(2, self.quan_bit_width) - 1]
@@ -250,12 +255,17 @@ class Parameter_Quantizer:
         self.quantized_names = []
         for n, p in named_params:
             assert isinstance(p, torch.nn.Parameter)
-            self.quantizers_list.append(Parameter_BaseQuantizer(scheme,
-                                                      params=p, int_range=self.quan_range, momentum=0.99,
-                                                      allow_zp_out_of_bound=self.allow_zp_out_of_bound))
+            quantizer = Parameter_BaseQuantizer(scheme,
+                                                params=p, int_range=self.quan_range, momentum=0.99,
+                                                allow_zp_out_of_bound=self.allow_zp_out_of_bound)
+            self.quantizers_list.append(quantizer)
             self.quantized_names.append(n)
             suffix = 'Keep the Float in Quantization' if self.float_kept else 'Directly Quantize'
-            print('[{}] use \033[35m[{}]\033[0m quantization scheme in \033[35m{} bit\033[0m, \033[34m{}\033[0m.'.format(n, scheme, self.quan_bit_width, suffix))
+            print(
+                '[{name:}] use \033[35m[{scheme:}]\033[0m quantization scheme in \033[35m{bw:.3g} bit\033[0m, '
+                'allow_zp_out_bound = {zp_out:}, \033[34m{suffix:}\033[0m.'.format(
+                    name=n, scheme=quantizer.scheme, bw=math.log2(quantizer.int_range[-1] + 1),
+                    zp_out=quantizer.allow_zp_out_of_bound, suffix=suffix))
 
     def quantize(self):
         for quanter in self.quantizers_list:
@@ -295,6 +305,43 @@ class Parameter_Quantizer:
     def reset_save_restore_times(self):
         self.reset_save_times()
         self.reset_restore_times()
+
+
+class Activation_BaseQuantizer(BaseQuantizer):
+    def __init__(self, *args, **kwargs):
+        super(Activation_BaseQuantizer, self).__init__(*args, **kwargs)
+
+    def quantize_hook(self, module, input):
+        assert isinstance(input, tuple)
+        assert len(input) == 1
+        return self.update(input[0])
+
+
+class Activation_Quantizer:
+    def __init__(self, *args, named_modules=None,  quan_bw=8, **kwargs):
+        if named_modules is not None:
+            assert isinstance(named_modules, (list, dict))
+
+            for name, module in (named_modules.items() if isinstance(named_modules, dict) else named_modules):
+                assert isinstance(name, str)
+                assert isinstance(module, torch.nn.Module)
+        else:
+            raise ValueError('\033[31m请传入需要Activation Quantize的module字典。\033[0m')
+
+        self.quan_bit_width = quan_bw
+        self.quan_range = [0, pow(2, self.quan_bit_width) - 1]
+        self.quantizer_dict = {}
+        for name, module in (named_modules.items() if isinstance(named_modules, dict) else named_modules):
+            self.quantizer_dict[name] = Activation_BaseQuantizer(*args, int_range=self.quan_range, **kwargs)
+            module.register_forward_pre_hook(self.quantizer_dict[name].quantize_hook)
+            print(
+                '[{layer_name:}] has register \033[35m {bw:.3g}-bit\033[0m using \033[35m{quan_scheme:}\033[0m '
+                'scheme activation quantization, allow_zp_out_bound = {zp_out:}'.format(
+                    layer_name=name, bw=math.log2(self.quantizer_dict[name].int_range[-1] + 1),
+                    quan_scheme=self.quantizer_dict[name].scheme,
+                    zp_out=self.quantizer_dict[name].allow_zp_out_of_bound))
+
+
 
 def get_correct(x, scheme='MinMax', qmin=0, qmax=255):
     valid_scheme = ['MinMax', 'Symmetric']

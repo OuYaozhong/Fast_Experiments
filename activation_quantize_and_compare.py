@@ -6,11 +6,10 @@ import torchvision.transforms as transforms
 from torchvision.models import resnet18
 import torch.optim as optim
 from torch import nn
-import torch.nn.functional as F
 import re
 import os
 
-from quantizers.quantizer import Parameter_Quantizer
+from quantizers.quantizer import Parameter_Quantizer, Activation_Quantizer
 
 from progress.bar import Bar
 import wandb
@@ -20,24 +19,27 @@ default_setting_dict=dict(
     lr_scheme='adaptive',
     learning_rate=0.005,
     batch_size=150,
-    momentum=0.9,
+    optim_momentum=0.9,
     max_epoch=150,
     observe_period=7,
     drop_lr_period=14,
-    stop_period=25,
+    stop_period=28,
     stop_ratio=0.1,
     drop_ratio=0.1,
     lr_drop_multiplier=0.1,
     use_pretrain=True,
-    float_kept_quantize=False,
-    weight_bw=8,
-    bias_bw=0,
+    float_kept_quantize=True,
+    weight_bw=7,
+    bias_bw=32,
     activation_bw=8,
     quantize_momentum=0.99,
     weight_quantize_scheme='AdaptiveMoving',
     bias_quantize_scheme='AdaptiveMoving',
-    optimizer='adam',
-    activation_quantize_layer_type=[nn.Conv2d]
+    optimizer='sgd',
+    weight_quantize_layer_type=[nn.Conv2d],
+    bias_quantize_layer_type=[nn.Conv2d, nn.BatchNorm2d],
+    activation_quantize_layer_type=[nn.Conv2d],
+    activation_quantize_scheme='AdaptiveMoving'
 )
 
 default_setting_dict.update({'break_epoch_after_lr_drop': default_setting_dict['observe_period']})
@@ -47,6 +49,8 @@ wandb.init(project='test', config=default_setting_dict)
 
 # 2. Save model inputs and hyperparameters
 config = wandb.config
+
+print(config)
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -77,38 +81,99 @@ model = resnet18(pretrained=config.use_pretrain, progress=True)
 model.to(device)
 
 if config.weight_bw > 0:
-    weight_quantize_list = [(name, param) for name, param in model.named_parameters() if re.search('weight', name, re.I)]
-    weight_quantizer = Parameter_Quantizer(weight_quantize_list, quan_bw=config.weight_bw, momentum=config.quantize_momentum,
-                                 scheme=config.weight_quantize_scheme, allow_zp_out_of_bound=False,
-                                 float_kept=config.float_kept_quantize)
+    print('='*20 + '\033[34mConfigure Weight Quantize\033[0m' + '='*20)
+    weight_quantize_layer_type = []
+    for s in config.weight_quantize_layer_type:
+        if os.path.exists(s):
+            raise EnvironmentError(
+                '\033[31mThe wandb config.parameter_quantize_layer_type contain a valid path, Please Pay Attention '
+                'about the Security Problem.\n wandb的config.parameter_quantize_layer_type 包含合法路径， 请注意安全问题。\033[0m')
+        else:
+            weight_quantize_layer_type.append(eval(s))
+    weight_quantize_layer_type = tuple(weight_quantize_layer_type)
+
+    weight_quantize_list = []
+    for module_name, module in model.named_modules():
+        if isinstance(module, weight_quantize_layer_type):
+            for param_name, param in module.named_parameters():
+                if re.search('weight', param_name, re.I):
+                    full_name = '.'.join([module_name, param_name])
+                    weight_quantize_list.append((full_name, param))
+
+    if len(weight_quantize_list) > 0:
+        weight_quantizer = Parameter_Quantizer(weight_quantize_list, quan_bw=config.weight_bw,
+                                               momentum=config.quantize_momentum,
+                                               scheme=config.weight_quantize_scheme, allow_zp_out_of_bound=False,
+                                               float_kept=config.float_kept_quantize)
+    else:
+        raise EnvironmentError('\033[31mNo WEIGHT can be quantize under the this setting.\033[0m')
+
     if config.float_kept_quantize:
         weight_quantizer.save_params_from_data_to_org()
     weight_quantizer.quantize()
     print('weight will be quantized.')
+    print('=' * 20 + ' END ' + '=' * 20 + '\n')
 
 if config.bias_bw > 0:
-    bias_quantize_list = [(name, param) for name, param in model.named_parameters() if re.search('bias', name, re.I)]
-    bias_quantizer = Parameter_Quantizer(bias_quantize_list, quan_bw=config.bias_bw, momentum=config.quantize_momentum,
-                               scheme=config.bias_quantize_scheme, allow_zp_out_of_bound=False,
-                               float_kept=config.float_kept_quantize)
+    print('=' * 20 + '\033[34mConfigure Bias Quantize\033[0m' + '=' * 20)
+    bias_quantize_layer_type = []
+    for s in config.bias_quantize_layer_type:
+        if os.path.exists(s):
+            raise EnvironmentError(
+                '\033[31mThe wandb config.parameter_quantize_layer_type contain a valid path, Please Pay Attention '
+                'about the Security Problem.\n wandb的config.parameter_quantize_layer_type 包含合法路径， 请注意安全问题。\033[0m')
+        else:
+            bias_quantize_layer_type.append(eval(s))
+    bias_quantize_layer_type = tuple(bias_quantize_layer_type)
+
+    bias_quantize_list = []
+    for module_name, module in model.named_modules():
+        if isinstance(module, bias_quantize_layer_type):
+            for param_name, param in module.named_parameters():
+                if re.search('bias', param_name, re.I):
+                    full_name = '.'.join([module_name, param_name])
+                    bias_quantize_list.append((full_name, param))
+    if len(bias_quantize_list) > 0:
+        bias_quantizer = Parameter_Quantizer(bias_quantize_list, quan_bw=config.bias_bw,
+                                             momentum=config.quantize_momentum,
+                                             scheme=config.bias_quantize_scheme, allow_zp_out_of_bound=False,
+                                             float_kept=config.float_kept_quantize)
+    else:
+        raise EnvironmentError('\033[31mNo BIAS can be quantize under the this setting.\033[0m')
+
     if config.float_kept_quantize:
         bias_quantizer.save_params_from_data_to_org()
     bias_quantizer.quantize()
     print('bias will be quantized.')
+    print('=' * 20 + ' END ' + '=' * 20 + '\n')
 
-# if config.activation_bw > 0:
-#     activation_quantize_list = []
-#     quantize_layer_list = [eval(s) for s in config.activation_quantize_layer_type if not os.path.exists(s)]
-#     for name, module in model.named_modules():
-#         if isinstance(module, tuple(quantize_layer_list)):
-#             activation_quantize_list.append((name, module))
-#     activation_quantizer_dict = {}
-#     for name, module in activation_quantize_list:
-#         activation_quantizer_dict[name] = BaseQuantizer()
+if config.activation_bw > 0:
+    print('=' * 20 + '\033[34mConfigure Activation Quantize\033[0m' + '=' * 20)
+    activation_quantize_layer_type = []
+    for s in config.activation_quantize_layer_type:
+        if os.path.exists(s):
+            raise EnvironmentError(
+                '\033[31mThe wandb config.parameter_quantize_layer_type contain a valid path, Please Pay Attention '
+                'about the Security Problem.\n wandb的config.parameter_quantize_layer_type 包含合法路径， 请注意安全问题。\033[0m')
+        else:
+            activation_quantize_layer_type.append(eval(s))
+    activation_quantize_list = [(name, module) for name, module in model.named_modules() if
+                                isinstance(module, tuple(activation_quantize_layer_type))]
+
+    if len(activation_quantize_list) > 0:
+        activation_quantizer = Activation_Quantizer(named_modules=activation_quantize_list,
+                                                    scheme=config.activation_quantize_scheme, quan_bw=8,
+                                                    momentum=0.99, allow_zp_out_of_bound=False)
+    else:
+        raise EnvironmentError('\033[31mNo ACTIVATION can be quantize under the this setting.\033[0m')
+
+    print('activation will be quantize.')
+    print('=' * 20 + ' END ' + '=' * 20 + '\n')
+
 
 criterion = nn.CrossEntropyLoss()
 if config.optimizer == 'sgd':
-    optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.momentum)
+    optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.optim_momentum)
     print('Optimizer is set to \033[35mSGD\033[0m, using lr={}, momentum={}.'.format(optimizer.param_groups[0]['lr'],
                                                                                      optimizer.param_groups[0][
                                                                                          'momentum']))
