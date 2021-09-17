@@ -15,7 +15,7 @@ from progress.bar import Bar
 import wandb
 
 
-default_setting_dict=dict(
+default_setting_dict = dict(
     lr_scheme='adaptive',
     learning_rate=0.005,
     batch_size=150,
@@ -28,7 +28,7 @@ default_setting_dict=dict(
     drop_ratio=0.1,
     lr_drop_multiplier=0.1,
     use_pretrain=True,
-    float_kept_quantize=True,
+    float_kept_quantize=False,
     weight_bw=7,
     bias_bw=32,
     activation_bw=8,
@@ -39,7 +39,8 @@ default_setting_dict=dict(
     weight_quantize_layer_type=[nn.Conv2d],
     bias_quantize_layer_type=[nn.Conv2d, nn.BatchNorm2d],
     activation_quantize_layer_type=[nn.Conv2d],
-    activation_quantize_scheme='AdaptiveMoving'
+    activation_quantize_scheme='AdaptiveMoving',
+    quantize_strategy='dorefa'
 )
 
 default_setting_dict.update({'break_epoch_after_lr_drop': default_setting_dict['observe_period']})
@@ -104,7 +105,8 @@ if config.weight_bw > 0:
         weight_quantizer = Parameter_Quantizer(weight_quantize_list, quan_bw=config.weight_bw,
                                                momentum=config.quantize_momentum,
                                                scheme=config.weight_quantize_scheme, allow_zp_out_of_bound=False,
-                                               float_kept=config.float_kept_quantize)
+                                               float_kept=config.float_kept_quantize,
+                                               quantize_strategy=config.quantize_strategy)
     else:
         raise EnvironmentError('\033[31mNo WEIGHT can be quantize under the this setting.\033[0m')
 
@@ -137,7 +139,8 @@ if config.bias_bw > 0:
         bias_quantizer = Parameter_Quantizer(bias_quantize_list, quan_bw=config.bias_bw,
                                              momentum=config.quantize_momentum,
                                              scheme=config.bias_quantize_scheme, allow_zp_out_of_bound=False,
-                                             float_kept=config.float_kept_quantize)
+                                             float_kept=config.float_kept_quantize,
+                                             quantize_strategy=config.quantize_strategy)
     else:
         raise EnvironmentError('\033[31mNo BIAS can be quantize under the this setting.\033[0m')
 
@@ -163,7 +166,8 @@ if config.activation_bw > 0:
     if len(activation_quantize_list) > 0:
         activation_quantizer = Activation_Quantizer(named_modules=activation_quantize_list,
                                                     scheme=config.activation_quantize_scheme, quan_bw=8,
-                                                    momentum=0.99, allow_zp_out_of_bound=False)
+                                                    momentum=0.99, allow_zp_out_of_bound=False,
+                                                    quantize_strategy=config.quantize_strategy)
     else:
         raise EnvironmentError('\033[31mNo ACTIVATION can be quantize under the this setting.\033[0m')
 

@@ -46,12 +46,48 @@ class Observer(object):
                'same_sign: {}\n' \
                ']'.format(self_name, self.min, self.max, self.full_scale, self.same_sign)
 
+def get_round_with_grad_fn():
+    class BackwarkableRound(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, input):
+            input_round = input.round()
+            return input_round
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            grad_input = grad_output.clone()
+            return grad_input
+
+    return BackwarkableRound().apply
+
+
+def uniform_quantize(k):
+  class qfn(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, input):
+      if k == 32:
+        out = input
+      elif k == 1:
+        out = torch.sign(input)
+      else:
+        n = float(2 ** k - 1)
+        out = torch.round(input * n) / n
+      return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+      grad_input = grad_output.clone()
+      return grad_input
+
+  return qfn().apply
+
 
 class BaseQuantizer(object):
     valid_scheme_keys = ['Moving', ('MinMax', 'Symmetric'), 'Adaptive'] # 嵌套深度: 1 层
 
     def __init__(self, scheme: str = 'MovingMinMax', int_range: (list, tuple) = None, momentum: float = None,
-                 allow_zp_out_of_bound: bool = True):
+                 allow_zp_out_of_bound: bool = True, quantize_strategy='dorefa'):
         self.allow_zp_out_of_bound = allow_zp_out_of_bound
         # below parameters are left to scheme_praser to set
         self.symmetric = None
@@ -60,7 +96,9 @@ class BaseQuantizer(object):
         # end
         # 先让scheme_praser解析scheme参数，设置重要的变量
         self.scheme = scheme
-        self.scheme_praser(scheme=self.scheme, momentum=momentum)
+        self.scheme_parser(scheme=self.scheme, momentum=momentum)
+        assert quantize_strategy in ['dorefa', 'normal']
+        self.quantize_strategy = quantize_strategy
 
         self.observer = Observer(momentum=self.momentum)
 
@@ -77,6 +115,7 @@ class BaseQuantizer(object):
         self.float_max = None # the minimum of the floating-point in quantization, and outlier will be clamped
         self.int_full_scale = None
         self.float_full_scale = None
+        self.ENOB = None
         # end
 
         self.eps = 7./3 - 4./3 - 1
@@ -84,7 +123,9 @@ class BaseQuantizer(object):
         self.data = None
         self.zp = None
 
-    def scheme_praser(self, scheme: str, momentum: float):
+
+
+    def scheme_parser(self, scheme: str, momentum: float):
         # 检验scheme的有效性
         self.scheme_validate(scheme)
         # set momentum
@@ -162,15 +203,25 @@ class BaseQuantizer(object):
             self.float_min = xmin
         self.int_full_scale = self.int_max - self.int_min
         self.float_full_scale = self.float_max - self.float_min
+
+        # ENOB calcualte
+        assert self.int_max > self.int_min
+        self.ENOB = math.log2(self.int_max - self.int_min + 1)
+        self.uniform_quantizer = uniform_quantize(int(math.log2(self.int_max - self.int_min + 1)))
         return
 
     def update(self, data_to_be_quantize: torch.Tensor):
         self.observer.update(data_to_be_quantize)
         # reset the quantization setting based on new observation
         self._update_quantize_config()
-        self.data, self.scale, self.zp = self._quantize(data_to_be_quantize)
-        data_to_be_quantize = self.float()
-        return data_to_be_quantize
+        if self.quantize_strategy == 'dorefa':
+            data_pseudo_q, self.scale, self.zp = self.dorefa(data_to_be_quantize)
+        elif self.quantize_strategy == 'normal':
+            self.data, self.scale, self.zp = self._quantize(data_to_be_quantize)
+            data_pseudo_q = self.float()
+        else:
+            raise ValueError
+        return data_pseudo_q
 
     def _quantize(self, x: torch.Tensor):
         # 由于其他函数 self._update_quantize_config 设置好了参数，因而，_quantize函数无论什么情况，都按照一样的流程进行量化
@@ -183,6 +234,31 @@ class BaseQuantizer(object):
         if (not self.allow_zp_out_of_bound) and ((zp < self.int_min) or (zp > self.int_max)):
             raise ValueError('The zp should not beyond [{}, {}] under setting allow_zp_out_of_bound = {}'.format(self.int_min, self.int_max, self.allow_zp_out_of_bound))
         data = (x / scale + zp).round().int()
+        if self.symmetric:
+            assert zp == (self.int_min + self.int_max) // 2
+        return data, scale, zp
+
+    def dorefa(self, x: torch.Tensor):
+        # 由于其他函数 self._update_quantize_config 设置好了参数，因而，_quantize函数无论什么情况，都按照一样的流程进行量化
+        self._check_data(x)
+        scale = self.float_full_scale / self.int_full_scale
+        scale = max(scale, self.eps)
+        zp = self.int_min - round(self.float_min / scale)
+        if not self.allow_zp_out_of_bound:
+            zp = min(max(zp, self.int_min), self.int_max)
+        if (not self.allow_zp_out_of_bound) and ((zp < self.int_min) or (zp > self.int_max)):
+            raise ValueError('The zp should not beyond [{}, {}] under setting allow_zp_out_of_bound = {}'.format(self.int_min, self.int_max, self.allow_zp_out_of_bound))
+        # data = self.backward_round(x / scale + zp)
+        if self.ENOB == 32:
+            data = x
+        elif self.ENOB == 1:
+            E = torch.mean(torch.abs(x)).detach()
+            data = self.uniform_quantizer(x / E) * E
+        else:
+            data = torch.tanh(x)
+            data_max = data.abs().max().detach()
+            data = data / data_max / 2 + 0.5
+            data = data_max * (2 * self.uniform_quantizer(data) - 1)
         if self.symmetric:
             assert zp == (self.int_min + self.int_max) // 2
         return data, scale, zp
@@ -245,27 +321,30 @@ class Parameter_BaseQuantizer(BaseQuantizer):
 
 class Parameter_Quantizer:
     def __init__(self, named_params, quan_bw=8, momentum=0.99, scheme='Moving', allow_zp_out_of_bound=True,
-                 float_kept=False):
+                 float_kept=False, quantize_strategy='dorefa'):
         self.quan_bit_width = quan_bw
         self.float_kept = float_kept
         self.quan_range = [0, pow(2, self.quan_bit_width) - 1]
         self.momentum = momentum
         self.allow_zp_out_of_bound = allow_zp_out_of_bound
+        self.quantize_strategy = quantize_strategy
         self.quantizers_list = []
         self.quantized_names = []
         for n, p in named_params:
             assert isinstance(p, torch.nn.Parameter)
             quantizer = Parameter_BaseQuantizer(scheme,
                                                 params=p, int_range=self.quan_range, momentum=0.99,
-                                                allow_zp_out_of_bound=self.allow_zp_out_of_bound)
+                                                allow_zp_out_of_bound=self.allow_zp_out_of_bound,
+                                                quantize_strategy=self.quantize_strategy)
             self.quantizers_list.append(quantizer)
             self.quantized_names.append(n)
             suffix = 'Keep the Float in Quantization' if self.float_kept else 'Directly Quantize'
             print(
-                '[{name:}] use \033[35m[{scheme:}]\033[0m quantization scheme in \033[35m{bw:.3g} bit\033[0m, '
-                'allow_zp_out_bound = {zp_out:}, \033[34m{suffix:}\033[0m.'.format(
+                '[{name:}] use \033[35m[{scheme:}]\033[0m quantization scheme in \033[35m{bw:.3g} bit\033[0m, with '
+                '\033[35m{strategy:}\033[0m strategy, allow_zp_out_bound = {zp_out:}, \033[34m{suffix:}\033[0m.'.format(
                     name=n, scheme=quantizer.scheme, bw=math.log2(quantizer.int_range[-1] + 1),
-                    zp_out=quantizer.allow_zp_out_of_bound, suffix=suffix))
+                    strategy=quantizer.quantize_strategy,
+            zp_out = quantizer.allow_zp_out_of_bound, suffix = suffix))
 
     def quantize(self):
         for quanter in self.quantizers_list:
@@ -335,10 +414,11 @@ class Activation_Quantizer:
             self.quantizer_dict[name] = Activation_BaseQuantizer(*args, int_range=self.quan_range, **kwargs)
             module.register_forward_pre_hook(self.quantizer_dict[name].quantize_hook)
             print(
-                '[{layer_name:}] has register \033[35m {bw:.3g}-bit\033[0m using \033[35m{quan_scheme:}\033[0m '
-                'scheme activation quantization, allow_zp_out_bound = {zp_out:}'.format(
+                '[{layer_name:}] has register \033[35m {bw:.3g}-bit\033[0m using \033[35m{quan_scheme:}\033[0m scheme '
+                'activation quantization, with \033[35m{strategy:}\033[0m strategy, '
+                'allow_zp_out_bound = {zp_out:}'.format(
                     layer_name=name, bw=math.log2(self.quantizer_dict[name].int_range[-1] + 1),
-                    quan_scheme=self.quantizer_dict[name].scheme,
+                    quan_scheme=self.quantizer_dict[name].scheme, strategy=self.quantizer_dict[name].quantize_strategy,
                     zp_out=self.quantizer_dict[name].allow_zp_out_of_bound))
 
 
