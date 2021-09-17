@@ -20,7 +20,7 @@ default_setting_dict = dict(
     learning_rate=0.005,
     batch_size=150,
     optim_momentum=0.9,
-    max_epoch=150,
+    max_epoch=200,
     observe_period=7,
     drop_lr_period=14,
     stop_period=28,
@@ -29,9 +29,9 @@ default_setting_dict = dict(
     lr_drop_multiplier=0.1,
     use_pretrain=True,
     float_kept_quantize=False,
-    weight_bw=7,
-    bias_bw=32,
-    activation_bw=8,
+    weight_bw=0,
+    bias_bw=0,
+    activation_bw=0,
     quantize_momentum=0.99,
     weight_quantize_scheme='AdaptiveMoving',
     bias_quantize_scheme='AdaptiveMoving',
@@ -165,7 +165,8 @@ if config.activation_bw > 0:
 
     if len(activation_quantize_list) > 0:
         activation_quantizer = Activation_Quantizer(named_modules=activation_quantize_list,
-                                                    scheme=config.activation_quantize_scheme, quan_bw=8,
+                                                    scheme=config.activation_quantize_scheme,
+                                                    quan_bw=config.activation_bw,
                                                     momentum=0.99, allow_zp_out_of_bound=False,
                                                     quantize_strategy=config.quantize_strategy)
     else:
