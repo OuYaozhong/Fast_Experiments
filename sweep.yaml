@@ -5,13 +5,10 @@ metric:
   goal: maximize
 parameters:
   learning_rate:
+    distribution: log_uniform
     min: 1.0e-6
     max: 1.0e-1
-  float_kept_quantize:
-    values: [true, false]
-  weight_bw:
-    values: [4, 5, 6, 7, 8]
-  activation_bw:
+  bias_bw:
     values: [4, 6, 8, 10, 12, 16]
   optimizer:
     values: ["sgd", "adam"]
