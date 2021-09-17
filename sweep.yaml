@@ -5,8 +5,9 @@ metric:
   goal: maximize
 parameters:
   learning_rate:
-    min: 1.0e-6
-    max: 1.0e-1
+    distribution: log_uniform
+    min: -13.815510558E0
+    max: -2.30258509299E0
   float_kept_quantize:
     values: [true, false]
   weight_bw:
